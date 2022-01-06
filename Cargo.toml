@@ -37,3 +37,24 @@ coremidi = "0.6.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["mmsystem", "mmeapi"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "Event",
+    "Navigator",
+    "Window",
+    "MidiAccess",
+    "MidiInput",
+    "MidiInputMap",
+    "MidiMessageEvent",
+    "MidiOptions",
+    "MidiOutput",
+    "MidiOutputMap",
+    "MidiPort",
+    "MidiPortType"
+]}
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.2"
