@@ -33,7 +33,7 @@ nix = "0.15"
 libc = "0.2.21"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-coremidi = { git = "https://github.com/chris-zen/coremidi.git", rev = "753163a8e5aeb8d69d2e0558301fd34a3d04327a" }
+coremidi = "0.6.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["mmsystem", "mmeapi"] }
