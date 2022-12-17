@@ -7,9 +7,9 @@ use std::sync::Mutex;
 use std::io::{Write, stderr};
 use std::thread::sleep;
 use std::time::Duration;
-use memalloc::{allocate, deallocate};
 use std::mem::MaybeUninit;
 use std::ptr::null_mut;
+use std::alloc::{alloc, dealloc, Layout};
 
 use self::winapi::shared::basetsd::{DWORD_PTR, UINT_PTR};
 use self::winapi::shared::minwindef::{DWORD, UINT};
@@ -103,8 +103,8 @@ impl MidiInputPort {
             return Err(PortInfoError::CannotRetrievePortName)
         }
         let device_caps = unsafe { device_caps.assume_init() };
-        let pname = device_caps.szPname;
-        let output = from_wide_ptr(pname.as_ptr(), pname.len()).to_string_lossy().into_owned();
+        let pname_ptr: *const [u16; 32] = std::ptr::addr_of!(device_caps.szPname);
+        let output = from_wide_ptr(pname_ptr as *const _, 32).to_string_lossy().into_owned();
         Ok(output)
     }
 
@@ -218,7 +218,7 @@ impl MidiInput {
         // Allocate and init the sysex buffers.
         for i in 0..RT_SYSEX_BUFFER_COUNT {
             handler_data.sysex_buffer.0[i] = Box::into_raw(Box::new(MIDIHDR {
-                lpData: unsafe { allocate(RT_SYSEX_BUFFER_SIZE/*, mem::align_of::<u8>()*/) } as *mut i8,
+                lpData: unsafe { alloc(Layout::from_size_align_unchecked(RT_SYSEX_BUFFER_SIZE, 1)) } as *mut i8,
                 dwBufferLength: RT_SYSEX_BUFFER_SIZE as u32,
                 dwBytesRecorded: 0,
                 dwUser: i as DWORD_PTR, // We use the dwUser parameter as buffer indicator
@@ -285,7 +285,7 @@ impl<T> MidiInputConnection<T> {
             let result;
             unsafe {
                 result = midiInUnprepareHeader(*in_handle_lock, self.handler_data.sysex_buffer.0[i], mem::size_of::<MIDIHDR>() as u32);
-                deallocate((*self.handler_data.sysex_buffer.0[i]).lpData as *mut u8, RT_SYSEX_BUFFER_SIZE/*, mem::align_of::<u8>()*/);
+                dealloc((*self.handler_data.sysex_buffer.0[i]).lpData as *mut u8, Layout::from_size_align_unchecked(RT_SYSEX_BUFFER_SIZE, 1));
                 // recreate the Box so that it will be dropped/deallocated at the end of this scope
                 let _ = Box::from_raw(self.handler_data.sysex_buffer.0[i]);
             }
@@ -365,8 +365,8 @@ impl MidiOutputPort {
             return Err(PortInfoError::CannotRetrievePortName)
         }
         let device_caps = unsafe { device_caps.assume_init() };
-        let pname = device_caps.szPname;
-        let output = from_wide_ptr(pname.as_ptr(), pname.len()).to_string_lossy().into_owned();
+        let pname_ptr: *const [u16; 32] = std::ptr::addr_of!(device_caps.szPname);
+        let output = from_wide_ptr(pname_ptr as *const _, 32).to_string_lossy().into_owned();
         Ok(output)
     }
 

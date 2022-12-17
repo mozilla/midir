@@ -2,9 +2,10 @@
 
 All major changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.8.0] - 2022-05-13
 
-- ...
+- Upgrade `coremidi` and `alsa` dependencies
+- Implement `PartialEq` for ports
 
 ## [0.7.0] - 2020-09-05
 
