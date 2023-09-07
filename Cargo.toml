@@ -18,10 +18,10 @@ license = "MIT"
 [features]
 default = []
 avoid_timestamping = []
-jack = ["jack-sys", "libc"]
+jack = ["jack-sys", "libc", "bitflags"]
 
 [dependencies]
-bitflags = "1.2"
+bitflags = { version = "2", optional = true }
 memalloc = "0.1.0"
 jack-sys = { version = "0.1.0", optional = true }
 libc = { version = "0.2.21", optional = true }
