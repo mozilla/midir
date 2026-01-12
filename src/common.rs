@@ -4,6 +4,7 @@ use backend::{
     MidiInput as MidiInputImpl, MidiInputConnection as MidiInputConnectionImpl,
     MidiInputPort as MidiInputPortImpl, MidiOutput as MidiOutputImpl,
     MidiOutputConnection as MidiOutputConnectionImpl, MidiOutputPort as MidiOutputPortImpl,
+    PortWatcher as PortWatcherImpl,
 };
 use errors::*;
 
@@ -36,7 +37,7 @@ pub trait MidiIO {
 ///
 /// Use the `ports` method of a `MidiInput` instance to obtain
 /// available ports.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct MidiInputPort {
     pub(crate) imp: MidiInputPortImpl,
 }
@@ -207,7 +208,7 @@ impl<T> MidiInputConnection<T> {
 ///
 /// Use the `ports` method of a `MidiOutput` instance to obtain
 /// available ports.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct MidiOutputPort {
     pub(crate) imp: MidiOutputPortImpl,
 }
@@ -345,6 +346,84 @@ impl MidiOutputConnection {
     /// The message must be a valid MIDI message (see https://www.midi.org/specifications-old/item/table-1-summary-of-midi-message).
     pub fn send(&mut self, message: &[u8]) -> Result<(), SendError> {
         self.imp.send(message)
+    }
+}
+
+/// Events emitted when MIDI ports are added or removed from the system.
+#[derive(Debug, Clone)]
+pub enum PortEvent {
+    /// A new MIDI input port was added to the system.
+    InputAdded(MidiInputPort),
+    /// A MIDI input port was removed from the system.
+    InputRemoved(MidiInputPort),
+    /// A new MIDI output port was added to the system.
+    OutputAdded(MidiOutputPort),
+    /// A MIDI output port was removed from the system.
+    OutputRemoved(MidiOutputPort),
+}
+
+/// Watches for MIDI port changes in the system and notifies via callback.
+///
+/// The watcher remains active as long as this object exists. Call `stop()`
+/// or drop the object to cease receiving notifications.
+///
+/// # Example
+///
+/// ```no_run
+/// use midir::{PortEvent, PortWatcher};
+///
+/// let watcher = PortWatcher::new(
+///     "my-app",
+///     |event, count: &mut u32| {
+///         *count += 1;
+///         match event {
+///             PortEvent::InputAdded(port) => println!("Input added: {}", port.id()),
+///             PortEvent::InputRemoved(port) => println!("Input removed: {}", port.id()),
+///             PortEvent::OutputAdded(port) => println!("Output added: {}", port.id()),
+///             PortEvent::OutputRemoved(port) => println!("Output removed: {}", port.id()),
+///         }
+///     },
+///     0u32,
+/// ).expect("Failed to create watcher");
+///
+/// // Keep watcher alive while you want notifications
+/// // ...time passes... plug or unplug devices, create or destroy virtual devices
+///
+/// let final_count = watcher.stop();
+/// println!("Total events: {}", final_count);
+/// ```
+pub struct PortWatcher<T: 'static> {
+    imp: PortWatcherImpl<T>,
+}
+
+impl<T: Send> PortWatcher<T> {
+    /// Create a new port watcher that will call `callback` whenever
+    /// MIDI ports are added or removed from the system.
+    ///
+    /// The `client_name` is used to identify this watcher to the system
+    /// (used by some backends like ALSA, useless on others).
+    ///
+    /// The `data` parameter allows passing custom state that will be
+    /// available in every callback invocation.
+    ///
+    /// # Notes
+    ///
+    /// - Callbacks are invoked from background threads, so the callback
+    ///   and data must be `Send`.
+    /// - Virtual ports created by your own application will also trigger
+    ///   notifications.
+    pub fn new<F>(client_name: &str, callback: F, data: T) -> Result<Self, InitError>
+    where
+        F: FnMut(PortEvent, &mut T) + Send + 'static,
+    {
+        PortWatcherImpl::new(client_name, callback, data).map(|imp| PortWatcher { imp })
+    }
+
+    /// Stop watching for port changes and return the user data.
+    /// This is equivalent to dropping the watcher, but allows
+    /// recovering the user data.
+    pub fn stop(self) -> T {
+        self.imp.stop()
     }
 }
 
