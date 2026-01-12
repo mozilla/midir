@@ -130,6 +130,42 @@ mod helpers {
             &mut self.ev
         }
     }
+
+    use alsa::{Direction, PollDescriptors};
+
+    const INVALID_POLLFD: libc::pollfd = libc::pollfd {
+        fd: -1,
+        events: 0,
+        revents: 0,
+    };
+
+    /// Set up poll file descriptors for a sequencer with a trigger fd for stopping.
+    pub fn setup_poll_fds(seq: &Seq, trigger_fd: i32) -> Vec<libc::pollfd> {
+        let poll_desc_info = (seq, Some(Direction::Capture));
+        let mut poll_fds = vec![INVALID_POLLFD; poll_desc_info.count() + 1];
+        poll_fds[0] = libc::pollfd {
+            fd: trigger_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        poll_desc_info.fill(&mut poll_fds[1..]).unwrap();
+        poll_fds
+    }
+
+    /// Wait for sequencer events, returns false if stop signal received.
+    pub fn wait_for_event(poll_fds: &mut [libc::pollfd], do_continue: &mut bool) {
+        if super::helpers::poll(poll_fds, -1) >= 0 {
+            if poll_fds[0].revents & libc::POLLIN != 0 {
+                let _res = unsafe {
+                    libc::read(
+                        poll_fds[0].fd,
+                        do_continue as *mut bool as *mut libc::c_void,
+                        std::mem::size_of::<bool>() as libc::size_t,
+                    )
+                };
+            }
+        }
+    }
 }
 
 const INITIAL_CODER_BUFFER_SIZE: usize = 32;
@@ -139,7 +175,7 @@ pub struct MidiInput {
     seq: Option<Seq>,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct MidiInputPort {
     addr: Addr,
 }
@@ -544,7 +580,7 @@ pub struct MidiOutput {
     seq: Option<Seq>, // TODO: if `Seq` is marked as non-zero, this should just be pointer-sized
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct MidiOutputPort {
     addr: Addr,
 }
@@ -755,14 +791,6 @@ impl Drop for MidiOutputConnection {
 
 fn handle_input<T>(mut data: HandlerData<T>, user_data: &mut T) -> HandlerData<T> {
     use alsa::seq::Connect;
-    use alsa::PollDescriptors;
-    use libc::pollfd;
-
-    const INVALID_POLLFD: pollfd = pollfd {
-        fd: -1,
-        events: 0,
-        revents: 0,
-    };
 
     let mut continue_sysex: bool = false;
 
@@ -771,16 +799,7 @@ fn handle_input<T>(mut data: HandlerData<T>, user_data: &mut T) -> HandlerData<T
     let mut buffer = [0; 12];
 
     let mut coder = helpers::EventDecoder::new(false);
-
-    let poll_desc_info = (&data.seq, Some(Direction::Capture));
-    let mut poll_fds = vec![INVALID_POLLFD; poll_desc_info.count() + 1];
-    poll_fds[0] = pollfd {
-        fd: data.trigger_rcv_fd.as_ref().unwrap().get(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-
-    poll_desc_info.fill(&mut poll_fds[1..]).unwrap();
+    let mut poll_fds = helpers::setup_poll_fds(&data.seq, data.trigger_rcv_fd.as_ref().unwrap().get());
 
     let mut message = MidiMessage::new();
 
@@ -792,18 +811,7 @@ fn handle_input<T>(mut data: HandlerData<T>, user_data: &mut T) -> HandlerData<T
         while do_input {
             if let Ok(0) = seq_input.event_input_pending(true) {
                 // No data pending
-                if helpers::poll(&mut poll_fds, -1) >= 0 {
-                    // Read from our "channel" whether we should stop the thread
-                    if poll_fds[0].revents & libc::POLLIN != 0 {
-                        let _res = unsafe {
-                            libc::read(
-                                poll_fds[0].fd,
-                                std::ptr::addr_of_mut!(do_input) as *mut libc::c_void,
-                                mem::size_of::<bool>() as libc::size_t,
-                            )
-                        };
-                    }
-                }
+                helpers::wait_for_event(&mut poll_fds, &mut do_input);
                 continue;
             }
 
@@ -917,4 +925,201 @@ fn handle_input<T>(mut data: HandlerData<T>, user_data: &mut T) -> HandlerData<T
         }
     } // close scope where data.seq is borrowed
     data // return data back to thread owner
+}
+
+/// Port watcher for ALSA backend
+pub struct PortWatcher<T: 'static> {
+    thread: Option<JoinHandle<(WatcherHandlerData<T>, T)>>,
+    trigger_send_fd: Option<PipeFd>,
+}
+
+struct WatcherHandlerData<T> {
+    seq: Seq,
+    trigger_rcv_fd: Option<PipeFd>,
+    callback: Box<dyn FnMut(crate::common::PortEvent, &mut T) + Send>,
+}
+
+// This implementation uses the ALSA sequencer: it creates a port to subscribe to device change
+// events, and gets the info back using a simple pipe.
+// Safety: this uses unsafe, because midir doesn't use something like nix.
+impl<T: Send> PortWatcher<T> {
+    pub fn new<F>(client_name: &str, callback: F, data: T) -> Result<Self, InitError>
+    where
+        F: FnMut(crate::common::PortEvent, &mut T) + Send + 'static,
+    {
+        let seq = Seq::open(None, None, true).map_err(|_| InitError)?;
+        let c_client_name = CString::new(client_name).map_err(|_| InitError)?;
+        seq.set_client_name(&c_client_name).map_err(|_| InitError)?;
+
+        let mut pinfo = PortInfo::empty().unwrap();
+        pinfo.set_capability(PortCap::WRITE | PortCap::SUBS_WRITE);
+        pinfo.set_type(PortType::MIDI_GENERIC | PortType::APPLICATION);
+        pinfo.set_name(c"midir port watcher");
+        seq.create_port(&pinfo).map_err(|_| InitError)?;
+        let vport = pinfo.get_port();
+
+        let sub = PortSubscribe::empty().unwrap();
+        sub.set_sender(Addr::system_announce());
+        sub.set_dest(Addr {
+            client: seq.client_id().unwrap(),
+            port: vport,
+        });
+        seq.subscribe_port(&sub).map_err(|_| InitError)?;
+
+        let mut trigger_fds = [-1, -1];
+        if unsafe { libc::pipe(trigger_fds.as_mut_ptr()) } == -1 {
+            return Err(InitError);
+        }
+        let trigger_rcv = PipeFd(trigger_fds[0]);
+        let trigger_send = PipeFd(trigger_fds[1]);
+
+        let handler_data = WatcherHandlerData {
+            seq,
+            trigger_rcv_fd: Some(trigger_rcv),
+            callback: Box::new(callback),
+        };
+
+        // Spawn handler thread
+        let thread = Builder::new()
+            .name(format!("midir port watcher ({})", client_name))
+            .spawn(move || {
+                let mut d = data;
+                let h = handle_port_events(handler_data, &mut d);
+                (h, d)
+            })
+            .map_err(|_| InitError)?;
+
+        Ok(PortWatcher {
+            thread: Some(thread),
+            trigger_send_fd: Some(trigger_send),
+        })
+    }
+
+    pub fn stop(mut self) -> T {
+        self.signal_stop();
+        let thread = self.thread.take().expect("thread already taken");
+        let (_handler_data, user_data) = thread.join().expect("watcher thread panicked");
+        user_data
+    }
+}
+
+impl<T> PortWatcher<T> {
+    fn signal_stop(&self) {
+        let _res = unsafe {
+            libc::write(
+                self.trigger_send_fd
+                    .as_ref()
+                    .expect("send_fd already taken")
+                    .get(),
+                &false as *const bool as *const _,
+                mem::size_of::<bool>() as libc::size_t,
+            )
+        };
+    }
+}
+
+impl<T> Drop for PortWatcher<T> {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            self.signal_stop();
+            let _ = thread.join();
+        }
+    }
+}
+
+fn handle_port_events<T>(
+    mut data: WatcherHandlerData<T>,
+    user_data: &mut T,
+) -> WatcherHandlerData<T> {
+    let mut poll_fds =
+        helpers::setup_poll_fds(&data.seq, data.trigger_rcv_fd.as_ref().unwrap().get());
+
+    let mut seq_input = data.seq.input();
+    let mut do_watch = true;
+
+    while do_watch {
+        if let Ok(0) = seq_input.event_input_pending(true) {
+            // No data pending
+            helpers::wait_for_event(&mut poll_fds, &mut do_watch);
+            continue;
+        }
+
+        // Read the event
+        let ev = match seq_input.event_input() {
+            Ok(ev) => ev,
+            Err(_) => continue,
+        };
+
+        let events: Box<dyn Iterator<Item = _>> = match ev.get_type() {
+            EventType::PortStart => match ev.get_data::<Addr>() {
+                Some(addr) => Box::new(addr_to_events(&data.seq, addr, PortChange::Added)),
+                None => Box::new(std::iter::empty()),
+            },
+            EventType::PortExit => match ev.get_data::<Addr>() {
+                Some(addr) => Box::new(addr_to_events(&data.seq, addr, PortChange::Removed)),
+                None => Box::new(std::iter::empty()),
+            },
+            _ => Box::new(std::iter::empty()),
+        };
+
+        for event in events {
+            (data.callback)(event, user_data);
+        }
+    }
+
+    drop(seq_input);
+    data
+}
+
+enum PortChange {
+    Added,
+    Removed,
+}
+
+/// Returns events for a port change. A port with both input and output
+/// capabilities will generate two events.
+fn addr_to_events(
+    seq: &Seq,
+    addr: Addr,
+    change: PortChange,
+) -> impl Iterator<Item = crate::common::PortEvent> {
+    use crate::common::PortEvent;
+
+    let info = seq.get_any_port_info(addr).ok();
+    let (is_input, is_output) = info
+        .filter(|pinfo| {
+            pinfo
+                .get_type()
+                .intersects(PortType::MIDI_GENERIC | PortType::SYNTH | PortType::APPLICATION)
+        })
+        .map(|pinfo| {
+            let caps = pinfo.get_capability();
+            (
+                caps.contains(PortCap::READ | PortCap::SUBS_READ),
+                caps.contains(PortCap::WRITE | PortCap::SUBS_WRITE),
+            )
+        })
+        .unwrap_or((false, false));
+
+    let input_event = is_input.then(|| {
+        let port = crate::common::MidiInputPort {
+            imp: MidiInputPort { addr },
+        };
+        match change {
+            PortChange::Added => PortEvent::InputAdded(port),
+            PortChange::Removed => PortEvent::InputRemoved(port),
+        }
+    });
+
+    let output_event = is_output.then(|| {
+        let port = crate::common::MidiOutputPort {
+            imp: MidiOutputPort { addr },
+        };
+        match change {
+            PortChange::Added => PortEvent::OutputAdded(port),
+            PortChange::Removed => PortEvent::OutputRemoved(port),
+        }
+    });
+
+    input_event.into_iter().chain(output_event)
 }
